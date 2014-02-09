@@ -1,5 +1,29 @@
 (** This module provides the companion implementation to our functional pearl. *)
 
+(** OCaml has built-in syntax for product types (tuples), but not for
+    sum types. *)
+type ('a, 'b) sum =
+| L of 'a
+| R of 'b
+
+type _ left_witness =
+| Var : string * 'a -> 'a left_witness
+| Apply : ('a -> 'b) left_witness * 'a right_witness -> 'b left_witness
+| Proj1 : ('a * 'b) left_witness -> 'a left_witness
+| Proj2 : ('a * 'b) left_witness -> 'b left_witness
+| LeftCase : ('a, 'b) sum left_witness -> 'a left_witness
+| RightCase : ('a, 'b) sum left_witness -> 'b left_witness
+
+and _ right_witness =
+| Const : 'a atom_witness -> 'a right_witness
+| Pair : 'a right_witness * 'b right_witness -> ('a * 'b) right_witness
+| Inj1 : 'a right_witness -> ('a, 'b) sum right_witness
+| Inj2 : 'b right_witness -> ('a, 'b) sum right_witness
+
+and _ atom_witness =
+| Init : 'a -> 'a atom_witness
+| Applied : 'a left_witness -> 'a atom_witness
+
 (** {2 The core module of our type descriptors } *)
 
 module Ty = struct
@@ -15,20 +39,17 @@ module Ty = struct
    * - a unique identifier. *)
   type 'a t = {
     eq: 'a -> 'a -> bool;
-    mutable enum : 'a list;
+    mutable enum : ('a * 'a left_witness option) list;
     fresh : ('a list -> 'a) option;
     invar : 'a -> bool;
     uid : int;
   }
 
   let mem (x: 'a) (s: 'a t): bool =
-    List.exists (fun y -> y = x) s.enum
+    List.exists (fun (y, _) -> y = x) s.enum
 
-  let add (x: 'a) (s: 'a t): unit =
-    if mem x s then () else s.enum <- x::s.enum
-
-  let elements (s: 'a t): 'a list =
-    s.enum
+  let add (x: 'a) (w : 'a left_witness option) (s: 'a t): unit =
+    if mem x s then () else s.enum <- (x,w)::s.enum
 
   let gensym: unit -> int =
     let r = ref (-1) in
@@ -47,7 +68,7 @@ module Ty = struct
     ?(invar = (fun _ -> true)) ()
   : 'a t = {
     eq;
-    enum = initial;
+    enum = List.map (fun v -> v,None) initial;
     fresh;
     invar;
     uid = gensym ()
@@ -79,12 +100,6 @@ end
 
 (** The type of our type descriptors. *)
 type 'a ty = 'a Ty.t
-
-(** OCaml has built-in syntax for product types (tuples), but not for
-    sum types. *)
-type ('a, 'b) sum =
-| L of 'a
-| R of 'b
 
 (** The GADT [('ty, 'head) negative] describes currified functions of
  * type ['ty] whose return datatype is a positive type ['head]. The
@@ -135,11 +150,11 @@ let ( *@ ) a b = Prod (a, b)
 
 (** Auxiliary functions on lists *)
 let concat_map f li = List.flatten (List.map f li)
-let cartesian_product la lb =
+let cartesian_product f la lb =
   let rec prod acc = function
     | [] -> acc
     | b::lb ->
-      let lab = List.rev_map (fun a -> (a, b)) la in
+      let lab = List.rev_map (fun a -> f a b) la in
       prod (List.rev_append lab acc) lb
   in prod [] lb
 
@@ -151,31 +166,36 @@ let cartesian_product la lb =
     negative], can be applied to deduce new values of type [b]. This
     requires producing known values for its (positive) arguments.
 *)
-let rec apply : type a b . (a, b) negative -> a -> b list =
-  fun ty v -> match ty with
-    | Ret pos -> [v]
-    | Fun (p, n) -> produce p |> concat_map (fun a -> apply n (v a))
-and produce : type a . a positive -> a list = function
-  | Ty ty -> ty.Ty.enum
-  | Prod (pa, pb) -> cartesian_product (produce pa) (produce pb)
+let rec apply : type a b . (a, b) negative -> a -> a left_witness -> (b * b left_witness) list =
+  fun ty v w -> match ty with
+    | Ret pos -> [v,w]
+    | Fun (p, n) -> produce p |> concat_map (fun (a, wa) -> apply n (v a) (Apply (w, wa)))
+and produce : type a . a positive -> (a * a right_witness) list = function
+  | Ty ty ->
+    let produce_atom (x, w) =
+      x, Const (match w with None -> Init x | Some w -> Applied w) in
+    ty.Ty.enum |> List.rev_map produce_atom
+  | Prod (pa, pb) ->
+    let pair (a,wa) (b,wb) = (a, b), Pair (wa, wb) in
+    cartesian_product pair (produce pa) (produce pb)
   | Sum (pa, pb) ->
-    let la = List.rev_map (fun v -> L v) (produce pa) in
-    let lb = List.rev_map (fun v -> R v) (produce pb) in
+    let la = List.rev_map (fun (v, w) -> L v, Inj1 w) (produce pa) in
+    let lb = List.rev_map (fun (v, w) -> R v, Inj2 w) (produce pb) in
     List.rev_append la lb
 
 (** A positive datatype can be destructed by pattern-matching to
     discover new values for the atomic types at its leaves. *)
-let rec destruct : type a . a positive -> a -> unit = function
-  | Ty ty -> begin fun v -> Ty.add v ty end
+let rec destruct : type a . a positive -> a -> a left_witness -> unit = function
+  | Ty ty -> begin fun v w -> Ty.add v (Some w) ty end
   | Prod (ta, tb) ->
-    begin fun (a, b) ->
-      destruct ta a;
-      destruct tb b;
+    begin fun (a, b) w ->
+      destruct ta a (Proj1 w);
+      destruct tb b (Proj2 w);
     end
   | Sum (ta, tb) ->
     begin function
-      | L a -> destruct ta a
-      | R b -> destruct tb b
+      | L a -> fun w -> destruct ta a (LeftCase w)
+      | R b -> fun w -> destruct tb b (RightCase w)
     end
 
 
@@ -196,13 +216,13 @@ let blows_after_n (exn: exn) (n: int): unit -> unit =
  * It [eval]s [fd] so as to generate a list of ['b]s, finds the descriptor of
  * type ['b], and then mutates it to stores all the elements we have constructed
  * (within a reasonable number, of course). *)
-let use (fd: ('a, 'b) negative) (f: 'a) =
-  let prod = apply fd f in
+let use (fd: ('a, 'b) negative) (f: 'a) (w : 'a left_witness) =
+  let prod = apply fd f w in
   let ty = codom fd in
   let tick = blows_after_n Exit 1000 in
   (* [Gabriel] I had to use this for ncheck to terminate in finite
      time on large signatures *)
-  try List.iter (fun x -> tick (); destruct ty x) prod;
+  try List.iter (fun (x, w) -> tick (); destruct ty x w) prod;
   with Exit -> ()
 
 (** This function populates an existing type descriptor who has a built-in
@@ -212,7 +232,7 @@ let populate n ty =
     | None -> invalid_arg "populate"
     | Some fresh ->
       for __ = 0 to n - 1 do
-        Ty.(add (fresh ty.enum) ty)
+        Ty.(add (fresh (List.rev_map fst ty.enum)) None ty)
       done
 
 
@@ -241,7 +261,7 @@ end
  * the module. *)
 let ncheck n (s: Sig.t) =
   for __ = 1 to n do
-    List.iter (fun (_id, Sig.Elem (fd, f)) -> use fd f) s;
+    List.iter (fun (id, Sig.Elem (fd, f)) -> use fd f (Var (id, f))) s;
   done
 
 (** Check a property over all the elements of datatype that were
@@ -249,7 +269,7 @@ let ncheck n (s: Sig.t) =
  * element that fails to satisfy the property, and [None] is no such element
  * exists. *)
 let counter_example ty f =
-  try Some (produce ty |> List.find (fun e -> not (f e)))
+  try Some (produce ty |> List.find (fun (e, _w) -> not (f e)))
   with Not_found -> None
 
 (* -------------------------------------------------------------------------- *)
